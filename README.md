@@ -1,252 +1,226 @@
-# BMO Strategy Tracking — Take-Home Solution
+BMO Strategy Tracking — Take-Home Solution
 
-Real-time monitoring of pricing-strategy spreads against a reference price:
-rolling statistics, two alert types, per-tick ranking, and up-time tracking.
+Real-time monitoring of pricing-strategy spreads against a reference price: rolling statistics, two alert types, per-tick ranking, and up-time tracking.
 
-## Quick start
-
-```bash
-pip install -r requirements.txt   # only pandas, used in analysis/validation, not required by the engine itself
+Quick Start
+pip install -r requirements.txt
 python -m unittest discover tests -v
 python main.py --input data/sample_stream_data.csv --output output/metrics.csv
-```
 
-`main.py --speed 50` replays the file at 50x real-time and prints alerts as
-they fire, to make the "streaming" nature visible rather than just batch.
 
-## Project layout
+main.py --speed 50 replays the file at 50× real-time and prints alerts as they fire, making the "streaming" nature visible rather than treating the input as a batch.
 
-```
+Project Layout
 src/
-  models.py          Tick / StrategyMetrics / ObservationResult dataclasses
-  ingest.py           CSV loading, cleaning, timestamp reconstruction, stream simulator
-  windowed_stats.py   Time-based rolling mean/std/median/MAD (deque-based)
-  alerts.py           Alert 1 (mean/std) and Alert 2 (median/MAD) scoring
-  ranking.py          Price ranking + up-time tracking
-  engine.py           Orchestrates the above per tick
-main.py               CLI: run the simulated stream end to end
-tests/test_pipeline.py 16 unit + integration tests
-```
+  models.py             Tick / StrategyMetrics / ObservationResult dataclasses
+  ingest.py             CSV loading, cleaning, timestamp reconstruction, stream simulator
+  windowed_stats.py     Time-based rolling mean/std/median/MAD (deque-based)
+  alerts.py             Alert 1 (mean/std) and Alert 2 (median/MAD) scoring
+  ranking.py            Price ranking + up-time tracking
+  engine.py             Orchestrates the above per tick
+main.py                 CLI: run the simulated stream end to end
+tests/test_pipeline.py  Unit + integration tests
 
-## Data-quality issues found and how I handled them
+Data-Quality Issues Found and How I Handled Them
 
-The raw CSV surprised me in three ways, all handled explicitly rather than
-silently:
+The raw CSV surprised me in three ways, all handled explicitly rather than silently:
 
-1. **Timestamps are truncated to `mm:ss.d`** : no date, no hour. I
-   reconstructed full timestamps by anchoring on the date/hour shown in the
-   PDF's Table 1 (`2017-05-08 09:xx`) and detecting a minute wrap-around
-   (any decrease in the minute value within an hour, minutes are
-   non-decreasing as real time advances, so any decrease at all signals
-   wrapping past `59 -> 00`) to roll the hour forward. Verified against
-   the raw file: the minute counter wraps 6 times across ~4,656 valid
-   rows, landing the last tick at `15:59:59`, which is internally consistent.
-   **This anchor date is not derived from the data. It's a documented
-   assumption, exposed as a `--anchor-date` CLI flag on `main.py`**
-   precisely so it doesn't silently mislabel a different file. Running
-   without the flag logs an explicit line stating the default is in
-   effect, rather than assuming silently.
-2. **~24 fully blank rows** scattered through the file (no timestamp, no
-   prices at all) are dropped. There's no timestamp to anchor them to, so
-   imputation isn't defensible. The drop count is returned by
-   `load_ticks(..., return_dropped=True)` and both logged and printed by
-   `main.py` (`"24 malformed row(s) dropped"`), not just computed and
-   discarded.
-3. **Per-strategy nulls** (a strategy just isn't quoting that tick) are
-   preserved as `None`, not zero-filled or forward-filled. Forward-filling
-   would understate a strategy's actual down-time and could mask a stuck
-   quote as a live one. Up-time and alerting both depend on nulls being
-   real.
+1. Timestamps are truncated to mm:ss.d
 
-## Design decisions worth defending
+There is no date or hour in the raw timestamps. I reconstructed full timestamps by anchoring on the date/hour shown in the PDF's Table 1 (2017-05-08 09:xx) and detecting minute wrap-around.
 
-- **Mean/variance use a sliding-window Welford's algorithm, not the naive
-  `sum_of_squares/n - mean**2` formula.** The naive formula subtracts two
-  large, nearly-equal numbers whenever values are large relative to their
-  variance, which can cause catastrophic cancellation. It
-  wasn't visibly broken at this dataset's actual price magnitudes
-  (~103.xx), but "wasn't broken on this particular input" isn't the same
-  as "is correct". Welford's algorithm (with the standard reverse-Welford
-  identity for eviction) avoids the cancellation entirely and costs
-  nothing extra (still O(1) per update). `tests/test_pipeline.py` includes
-  a stress test at a 1e8-offset/1e-6-spread scale specifically designed to
-  expose the difference, plus a randomized brute-force cross-check over
-  hundreds of add/evict operations.
-- **Time-based windows, not count-based.** Samples arrive at irregular
-  gaps (~5s but not exact) and can be null. A "last 60 observations" window
-  silently stretches or shrinks in wall-clock time whenever arrival rate
-  changes; "last 5 minutes" doesn't. This matters directly for the alert
-  threshold's meaning.
-- **Alerts are scored against the window *before* folding in the current
-  point**, then the point is folded in afterward. If you score against a
-  window that already includes the point being tested, a genuine outlier
-  widens its own std/MAD right when you want the band to stay tight, 
-  which systematically damps true positives. Scoring against strictly
-  prior history avoids that. This is a real modeling choice, not
-  implementation detail. I'd defend it as "judge new evidence against the
-  established baseline, not against itself."
-- **Cold start / degenerate windows never alert.** With <2 points, or a
-  zero-variance window (all identical spreads so far), `std`/`MAD` are
-  either undefined or zero, alerting there would mean "everything
-  triggers on the very first spike after a stable patch," which is exactly
-  when you least want alert fatigue. I chose false-negative-over-false-positive
-  for that narrow cold-start case and documented it in `alerts.py`.
-- **Up-time and rank are computed per-tick, not just at the end**, since
-  the spec says "for every observation," and a live dashboard would want
-  the running value, not a batch-end summary.
+Any decrease in the minute value within an hour signals a wrap from 59 → 00, causing the hour to roll forward.
 
-## Validation
+Verified against the raw file: the minute counter wraps 6 times across approximately 4,656 valid rows, landing the last tick at 15:59:59, which is internally consistent.
 
-`tests/test_pipeline.py` — 21 tests, `python -m unittest discover tests -v`:
-- Rolling mean/std/median validated against Python's `statistics` module
-  on a synthetic series that includes an outlier.
-- A numerical-stability stress test (large-offset, tiny-variance values)
-  and a randomized brute-force cross-check of the Welford's-algorithm
-  implementation against a naive ground-truth recomputation over hundreds
-  of add/evict operations.
-- MAD checked by hand-computed example.
-- Window eviction checked by advancing time past the window boundary and
-  confirming stale points drop out.
-- Null-handling: nulls don't get treated as zero and don't corrupt the
-  window.
-- A synthetic 60-tick stable series followed by one large spike is
-  asserted to trigger **both** alert types: an end-to-end sanity check
-  that the whole pipeline, not just individual functions, behaves as
-  expected.
-- Ingestion tests check the blank-row drop count and that the
-  reconstructed first timestamp matches the PDF's own example
-  (`09:30:04`).
+Important: This anchor date is not derived from the data. It is a documented assumption exposed as a --anchor-date CLI flag on main.py, precisely so it does not silently mislabel a different file.
 
-On the actual sample file (5-minute window): Alert 2 (median/MAD) fires far
-more often than Alert 1 (mean/std) — 947 vs. 84 events. See below for why,
-and which I'd actually run in production.
+Running without the flag logs an explicit line stating that the default is in effect rather than assuming silently.
 
----
+2. Fully blank rows
 
-## Discussion questions from the assignment
+Approximately 24 fully blank rows are scattered throughout the file (no timestamp and no prices).
 
-### Which alert type do you prefer? Which strategy would work better in production?
+These are dropped because there is no timestamp to anchor them to, so imputation is not defensible.
 
-**Alert 2 (median/MAD)**, for production, with a caveat below.
+The drop count is returned by:
 
-Mean and standard deviation are themselves distorted by the very outliers
-you're trying to detect: One bad print inflates the std enough that the
-*next* bad print might not clear the 3.5 threshold. Median and MAD don't
-have that problem; each individual point has bounded influence on them
-(that's the whole point of a robust statistic). That's exactly what we see
-in the sample: Alert 2 caught roughly 11x more events than Alert 1 over the
-same data, several of which were legitimate large deviations that Alert 1's
-own inflated std had effectively hidden from itself.
+load_ticks(..., return_dropped=True)
 
-The caveat: Alert 2's sensitivity is also its downside in production.
-It's not "smarter," it's more responsive, which means more noise if your
-spread naturally has fat tails (e.g. thin, illiquid names where a couple of
-wide prints per window are normal, not anomalous). In practice I'd run
-**both** side by side rather than picking one: Alert 1 as a coarse
-persistent-drift detector (mean-reversion / calibration failure), Alert 2
-as the primary anomaly detector for single-tick blowouts, and treat
-"both fired" as higher severity than either alone.
 
-**With larger window sizes and more granular data**, the case for Alert 2
-gets stronger, not weaker: larger windows make the mean/std pair even more
-vulnerable to a single early outlier dragging the baseline (a 30-minute
-window contaminated by one bad print stays contaminated for 30 minutes),
-while median/MAD's breakdown point (up to ~50% of points can be outliers
-before it breaks) barely notices. More granular data (sub-second ticks)
-means far more points per window, which helps both, but it also means the
-O(k log k) sort-per-update in this implementation starts to matter (see
-Scaling below).
+Both main.py and the ingestion layer expose this information so the rows are not silently discarded.
 
-### In a live trading system, monitoring thousands of securities/strategies, what would you do differently?
+3. Per-strategy nulls
 
-- **Partition by security**, not by strategy. We should route each security's ticks
-  to the same shard/consumer so all its strategies see a consistent
-  ordering and share a reference price without a cross-shard join. Kafka
-  topic keyed by security ID; each partition owns an in-memory window per
-  (security, strategy) pair.
-- **Move state out of a single Python process.** This implementation keeps
-  windows in per-process memory (`RollingWindow` deques), which is fine for one
-  security, not for thousands. I'd move to a stream processor (Kafka
-  Streams, Flink, or Spark Structured Streaming) that manages windowed
-  state per key natively with checkpointing so a restart doesn't lose the
-  rolling window.
-- **Separate the "hot path" (alerting) from the "cold path" (full
-  history/audit).** Alerting needs the last few minutes in memory and
-  needs to be fast; historical analysis, backtesting alert thresholds, and
-  compliance audit don't need sub-second latency and shouldn't share
-  infra with the thing that has to page someone at 2am.
-- **Alert deduplication / hysteresis.** A spread parked just above the
-  3.5 threshold will alert on every tick until it moves. That's alert
-  fatigue at scale. I'd add a state machine per (security, strategy, alert
-  type): OK -> ALERTING -> (stays ALERTING until it clears a lower
-  threshold, e.g. 2.5, for N consecutive ticks) -> OK, and only emit a
-  notification on state transitions, not on every tick.
-- **Backpressure and load shedding per key**, so one misbehaving security
-  spamming updates can't starve processing for the other thousands.
+A strategy may simply not quote during a particular tick.
 
-### Scaling to tens of thousands of observations/day, multiple time windows, thousands of securities/strategies
+These values are preserved as None, rather than being zero-filled or forward-filled.
 
-- **Multiple windows (5min/30min/1hr) from one state store, not
-  independent recomputation.** Maintain multiple `RollingWindow` instances
-  keyed by window size but backed by the *same* incoming stream, so a
-  single ingest reads the tick once and fans it out. As a result, we don't reread history
-  per window.
-- **Approximate/streaming algorithms once k (points per window) gets
-  large.** This implementation sorts the window on every update for
-  median/MAD, which is fine for k~60 (5min @ 5s), but not for a 1-hour window at
-  millisecond ticks (k in the hundreds of thousands). At that scale I'd
-  use a t-digest or KLL sketch for approximate quantiles/MAD, and Welford's
-  algorithm (already effectively what the running-sum approach does) for
-  numerically stable mean/std.
-- **Compute layer: Spark Structured Streaming or Flink** for the
-  thousands-of-securities case. Windowed aggregations are a first-class
-  primitive, state is checkpointed (recovers cleanly from a crash without
-  losing the rolling window), and it scales horizontally by partitioning
-  on security ID.
-- **Storage tiering:**
-  - **Kafka** as the ingest/transport layer, retained a few days for replay.
-  - **Hot store for current window state**: something like Redis or a
-    stream processor's own RocksDB-backed state store with sub-ms reads for
-    "what's the current rolling mean for this key."
-  - **Warm/cold store for history**: columnar, partitioned by date and
-    security (Parquet on S3/ADLS, or a time-series-oriented warehouse like
-    Snowflake/BigQuery/Timescale) for backtesting alert thresholds,
-    compliance queries, and model retraining. Partition + sort by
-    (date, security) so a query for "STRATEGY1 spreads for security X over
-    the last month" doesn't scan everything.
-  - **Data versioning**: object storage with a table format that supports
-    time travel and schema evolution (Delta Lake / Iceberg) rather than
-    raw Parquet files, so "what did this alert threshold look like on the
-    data as of last Tuesday" is an actual query, not a manual reconstruction.
-- **Model/config storage and serving**: alert thresholds and window sizes
-  aren't really "a model" here, but if this evolved into a learned
-  anomaly-detection model, I'd version it in a model registry (e.g.
-  MLflow) and serve it from the same stream processor as a UDF, so scoring
-  happens in the same pass as windowing instead of round-tripping to a
-  separate service per tick.
+Forward-filling would understate a strategy's actual down-time and could mask a stuck quote as a live one. Up-time and alerting both depend on nulls representing real missing quotes.
 
-### How do you launch, monitor, and maintain this once deployed?
+Design Decisions Worth Defending
+Numerically stable rolling statistics
 
-- **Launch**: containerize the stream-processing job, deploy behind CI/CD
-  with a staging environment replaying historical data before promoting to
-  prod; canary against a subset of securities before full rollout. (Not
-  suggesting Kubernetes here per your instructions since for a single
-  streaming job, a managed service, such as AWS MSK + Kinesis Data Analytics
-  / Managed Flink, or Databricks jobs for Spark Structured Streaming, gets
-  you most of the operational benefit without owning cluster orchestration.)
-- **Monitor**: emit pipeline health as its own metrics stream. Ingest
-  lag, `rows_dropped`, window-state size, alert rate per security (a
-  sudden spike in alert *volume* is itself worth alerting on, since it
-  often means upstream data corruption rather than real anomalies), and
-  end-to-end latency from tick arrival to alert emission. Dashboards +
-  on-call paging on lag/error-rate thresholds, separate from the trading
-  alerts themselves.
-- **Maintain**: version-control alert thresholds and window sizes as
-  config, not hardcoded constants, so tuning them is a reviewed PR, not a
-  code change; keep the validation test suite (like `tests/test_pipeline.py`
-  here) running in CI against both synthetic edge cases and a fixed
-  historical replay, so a change to the windowing logic can be checked
-  against known-good alert counts before it ships.
-#   s t r a t e g y _ t r a c k i n g  
- #   s t r a t e g y _ t r a c k i n g  
- 
+Mean/variance use a sliding-window Welford's algorithm rather than the naive:
+
+sum_of_squares / n - mean²
+
+
+formula.
+
+The naive formula subtracts two large, nearly equal numbers whenever values are large relative to their variance, which can cause catastrophic cancellation.
+
+It was not visibly broken at this dataset's actual price magnitudes (~103.xx), but "wasn't broken on this particular input" is not the same as "is numerically correct."
+
+Welford's algorithm, combined with the standard reverse-Welford identity for eviction, avoids the cancellation while remaining O(1) per update.
+
+tests/test_pipeline.py includes:
+
+A stress test at a 1e8 offset with a 1e-6 spread specifically designed to expose numerical instability.
+
+A randomized brute-force cross-check over hundreds of add/evict operations.
+
+Time-based windows, not count-based
+
+Samples arrive at irregular gaps (~5 seconds, but not exactly) and can be null.
+
+A "last 60 observations" window silently stretches or shrinks in wall-clock time whenever arrival rate changes. A "last 5 minutes" window does not.
+
+This matters directly for the meaning of the alert threshold.
+
+Score alerts against the previous window
+
+Alerts are scored against the window before folding in the current point. The current point is added afterward.
+
+If the point being tested is already included in the window, a genuine outlier widens its own standard deviation or MAD right when the detector needs the band to remain tight. This systematically dampens true positives.
+
+Scoring against strictly prior history avoids that problem.
+
+The modeling principle is:
+
+Judge new evidence against the established baseline, not against itself.
+
+Cold start and degenerate windows
+
+Cold-start and degenerate windows never alert.
+
+With fewer than two points, or with a zero-variance window where all spreads so far are identical, std/MAD are either undefined or zero.
+
+Alerting in that situation would effectively mean that everything triggers on the first spike after a stable patch — exactly when alert fatigue is least desirable.
+
+I chose a false-negative-over-false-positive approach for this narrow cold-start case and documented it in alerts.py.
+
+Per-tick ranking and up-time
+
+Up-time and rank are computed per tick rather than only at the end.
+
+The specification calls for results "for every observation," and a live dashboard would need the running value rather than a batch-end summary.
+
+Validation
+
+tests/test_pipeline.py contains 21 tests, run with:
+
+python -m unittest discover tests -v
+
+
+The test suite covers:
+
+Rolling mean/std/median validated against Python's statistics module on a synthetic series containing an outlier.
+
+A numerical-stability stress test using large-offset, tiny-variance values.
+
+A randomized brute-force cross-check of the Welford implementation against naive ground-truth recomputation over hundreds of add/evict operations.
+
+MAD validation using a hand-computed example.
+
+Window eviction by advancing time beyond the window boundary and confirming stale points are removed.
+
+Null handling, confirming nulls are not treated as zero and do not corrupt the rolling window.
+
+An end-to-end test using a synthetic 60-tick stable series followed by one large spike, asserting that both alert types trigger.
+
+Ingestion tests checking the blank-row drop count and confirming that the reconstructed first timestamp matches the PDF's example (09:30:04).
+
+On the actual sample file with a 5-minute window:
+
+Alert	Events
+Alert 1 — Mean/Std	84
+Alert 2 — Median/MAD	947
+
+See below for the interpretation of these results.
+
+Discussion Questions
+Which alert type do you prefer? Which strategy would work better in production?
+
+Alert 2 (median/MAD) is the more robust choice for production anomaly detection, with an important caveat.
+
+Mean and standard deviation are themselves affected by the outliers they are trying to detect. One bad print can inflate the standard deviation enough that a subsequent bad print no longer clears the 3.5 threshold.
+
+Median and MAD are much less affected by individual extreme observations. That is the purpose of using a robust statistic in the first place.
+
+That behavior is visible in the sample data: Alert 2 fires 947 times versus 84 events for Alert 1 over the same period. Some of those additional events may represent legitimate large deviations rather than anomalies, so the difference should not be interpreted as proof that Alert 2 is detecting "more true anomalies."
+
+The caveat is that Alert 2's sensitivity can also produce more noise in production if the underlying spread naturally has fat tails. For example, thin or illiquid names may legitimately experience several wide prints within a window.
+
+A practical production design would therefore run both:
+
+Alert 1: a coarse persistent-drift detector for things such as mean-reversion or calibration failures.
+
+Alert 2: the primary detector for individual large deviations.
+
+Both firing: an additional signal that could be assigned higher operational severity.
+
+With larger windows and more granular data, the case for robust statistics becomes stronger in some settings. Larger windows give an early outlier more opportunity to influence the mean/std baseline, while median/MAD remain substantially less sensitive to individual extreme observations.
+
+However, more granular data also increases the number of observations per window, which makes the current O(k log k) sort-per-update implementation increasingly expensive for median/MAD. See the scaling discussion below.
+
+In a live trading system, monitoring thousands of securities/strategies, what would you do differently?
+Partition by security
+
+Route each security's ticks to the same shard or consumer so all of its strategies see a consistent ordering and share a reference price without requiring a cross-shard join.
+
+For example, a Kafka topic could be keyed by security ID, with each partition owning an in-memory window for each (security, strategy) pair.
+
+Move state out of a single Python process
+
+This implementation keeps windows in per-process memory using RollingWindow deques.
+
+That is appropriate for a small-scale implementation, but not for thousands of securities.
+
+I would move the processing to a stream processor such as Kafka Streams, Flink, or Spark Structured Streaming, with checkpointed window state so a restart does not lose the rolling history.
+
+Separate the hot and cold paths
+
+The hot path should handle:
+
+Recent rolling windows.
+
+Alert evaluation.
+
+Low-latency processing.
+
+The cold path should handle:
+
+Full historical data.
+
+Backtesting.
+
+Alert-threshold analysis.
+
+Compliance/audit queries.
+
+These workloads have different latency and storage requirements and should not compete for the same resources.
+
+Add alert deduplication and hysteresis
+
+A spread sitting just above the 3.5 threshold could generate an alert on every tick until it moves back inside the threshold.
+
+At scale, that becomes alert fatigue.
+
+I would add a state machine per (security, strategy, alert_type):
+
+OK
+ ↓
+ALERTING
+ ↓
+wait for lower clear
